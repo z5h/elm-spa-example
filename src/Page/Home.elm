@@ -1,4 +1,4 @@
-module Page.Home exposing (Model, Msg, init, update, view)
+module Page.Home exposing (Model, Msg, initialize, update, view)
 
 {-| The homepage. You can get here via either the / or /#/ routes.
 -}
@@ -9,26 +9,48 @@ import Html exposing (..)
 import Html.Attributes exposing (attribute, class, classList, href, id, placeholder)
 import Html.Events exposing (onClick)
 import Http
-import Page.Errored exposing (PageLoadError, pageLoadError)
 import Request.Article
 import SelectList exposing (SelectList)
 import Task exposing (Task)
 import Util exposing ((=>), onClickStopPropagation)
 import Views.Article.Feed as Feed exposing (FeedSource, globalFeed, tagFeed, yourFeed)
-import Views.Page as Page
 
 
 -- MODEL --
 
 
-type alias Model =
+type alias ModelData =
     { tags : List Tag
     , feed : Feed.Model
     }
 
 
-init : Session -> Task PageLoadError Model
-init session =
+type Model
+    = NotReadyModel
+    | ReadyModel ModelData
+
+
+{-| Initialize returns a Model. It might not be entirely useful.
+Maybe we can render something from it. Use
+`prepare` to
+-}
+initialize : Session -> ( Model, Cmd Msg )
+initialize session =
+    let
+        model =
+            NotReadyModel
+
+        task =
+            load model session
+
+        resultToCmd =
+            Util.unpackResult ErrorLoadingMsg LoadedModelMsg
+    in
+        ( model, Task.attempt resultToCmd task )
+
+
+load : Model -> Session -> Task.Task String ModelData
+load model session =
     let
         feedSources =
             if session.user == Nothing then
@@ -42,12 +64,9 @@ init session =
 
         loadSources =
             Feed.init session feedSources
-
-        handleLoadError _ =
-            pageLoadError Page.Home "Homepage is currently unavailable."
     in
-    Task.map2 Model loadTags loadSources
-        |> Task.mapError handleLoadError
+        Task.map2 ModelData loadTags loadSources
+            |> Task.mapError Util.httpErrorString
 
 
 
@@ -56,20 +75,25 @@ init session =
 
 view : Session -> Model -> Html Msg
 view session model =
-    div [ class "home-page" ]
-        [ viewBanner
-        , div [ class "container page" ]
-            [ div [ class "row" ]
-                [ div [ class "col-md-9" ] (viewFeed model.feed)
-                , div [ class "col-md-3" ]
-                    [ div [ class "sidebar" ]
-                        [ p [] [ text "Popular Tags" ]
-                        , viewTags model.tags
+    case model of
+        NotReadyModel ->
+            div [] [ text "LOADING" ]
+
+        ReadyModel model ->
+            div [ class "home-page" ]
+                [ viewBanner
+                , div [ class "container page" ]
+                    [ div [ class "row" ]
+                        [ div [ class "col-md-9" ] (viewFeed model.feed)
+                        , div [ class "col-md-3" ]
+                            [ div [ class "sidebar" ]
+                                [ p [] [ text "Popular Tags" ]
+                                , viewTags model.tags
+                                ]
+                            ]
                         ]
                     ]
                 ]
-            ]
-        ]
 
 
 viewBanner : Html msg
@@ -111,21 +135,44 @@ viewTag tagName =
 type Msg
     = FeedMsg Feed.Msg
     | SelectTag Tag
+    | LoadedModelMsg ModelData
+    | ErrorLoadingMsg String
 
 
-update : Session -> Msg -> Model -> ( Model, Cmd Msg )
+update : Session -> Msg -> Model -> Result String ( Model, Cmd Msg )
 update session msg model =
-    case msg of
-        FeedMsg subMsg ->
-            let
-                ( newFeed, subCmd ) =
-                    Feed.update session subMsg model.feed
-            in
-            { model | feed = newFeed } => Cmd.map FeedMsg subCmd
+    let
+        ignore =
+            Result.Ok ( model, Cmd.none )
+    in
+        case ( model, msg ) of
+            ( _, ErrorLoadingMsg error ) ->
+                Result.Err error
 
-        SelectTag tagName ->
-            let
-                subCmd =
-                    Feed.selectTag (Maybe.map .token session.user) tagName
-            in
-            model => Cmd.map FeedMsg subCmd
+            ( NotReadyModel, LoadedModelMsg loadedData ) ->
+                Result.Ok ( ReadyModel loadedData, Cmd.none )
+
+            ( NotReadyModel, _ ) ->
+                ignore
+
+            ( ReadyModel data, msg ) ->
+                case msg of
+                    FeedMsg msgFeed ->
+                        let
+                            ( newFeed, subCmd ) =
+                                Feed.update session msgFeed data.feed
+                        in
+                            Result.Ok ( ReadyModel { data | feed = newFeed }, Cmd.map FeedMsg subCmd )
+
+                    SelectTag tagName ->
+                        let
+                            subCmd =
+                                Feed.selectTag (Maybe.map .token session.user) tagName
+                        in
+                            Result.Ok ( model, Cmd.map FeedMsg subCmd )
+
+                    LoadedModelMsg loadedData ->
+                        Result.Ok ( ReadyModel loadedData, Cmd.none )
+
+                    ErrorLoadingMsg error ->
+                        Result.Err error
